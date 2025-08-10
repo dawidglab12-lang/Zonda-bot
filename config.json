@@ -1,0 +1,8 @@
+{
+  "buy_threshold": -5,
+  "sell_threshold": 10,
+  "trade_amount_percent": 50,
+  "max_open_positions": 3,
+  "trading_pairs": ["ETH-PLN", "ADA-PLN", "ARB-PLN", "LINK-PLN", "SUSHI-PLN", "BTC-PLN", "SOL-PLN", "XRP-PLN", "TRX-PLN", "XLM-PLN"],
+  "check_interval_seconds": 60
+}

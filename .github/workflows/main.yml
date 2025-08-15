@@ -1,0 +1,199 @@
+# bot/bot.py
+import os, time, math, json, sys
+from datetime import datetime, timedelta, timezone
+import requests
+
+API_BASE = "https://api.zonda.exchange"
+PAIRS = [
+    "SOL-PLN", "ADA-PLN", "ARB-PLN", "BNB-PLN", "MATIC-PLN",
+    "LINK-PLN", "SUSHI-PLN", "TRX-PLN", "LSK-PLN",
+    "BTC-PLN", "ETH-PLN", "XRP-PLN", "DOGE-PLN",
+]
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "ZondaBot/1.0"})
+
+def rget(url, **kw):
+    """GET z retry i twardymi timeoutami."""
+    for i in range(3):
+        try:
+            resp = SESSION.get(url, timeout=12, **kw)
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            err = str(e)
+            if i == 2:
+                raise
+            time.sleep(1.2 * (i + 1))
+    raise RuntimeError(err)
+
+def get_candles(pair: str, interval_sec: int = 3600, limit: int = 120):
+    """
+    Próbuje pobrać historię świec dla pary z Zondy.
+    Próbujemy dwóch znanych ścieżek:
+      1) /rest/trading/candle/history/{pair}/{interval}?from=...&to=...
+      2) /rest/trading/candle/history/{pair}?resolution={interval}&from=...&to=...
+    Zwraca listę close'ów w kolejności rosnącej czasu.
+    """
+    now = int(time.time())
+    frm = now - interval_sec * (limit + 5)
+    to  = now
+
+    # wariant 1
+    url1 = f"{API_BASE}/rest/trading/candle/history/{pair}/{interval_sec}"
+    params = {"from": frm, "to": to, "limit": limit}
+    try:
+        data = rget(url1, params=params)
+        # Zonda zwykle zwraca: {"status":"Ok","items":[{"t":ts,"c":close,...}, ...]}
+        items = data.get("items") or data.get("candles") or []
+        closes = [float(it.get("c") or it.get("close")) for it in items if (it.get("c") or it.get("close")) is not None]
+        if closes:
+            return closes[-limit:]
+    except Exception:
+        pass
+
+    # wariant 2
+    url2 = f"{API_BASE}/rest/trading/candle/history/{pair}"
+    params = {"resolution": interval_sec, "from": frm, "to": to, "limit": limit}
+    try:
+        data = rget(url2, params=params)
+        items = data.get("items") or data.get("candles") or []
+        closes = [float(it.get("c") or it.get("close")) for it in items if (it.get("c") or it.get("close")) is not None]
+        if closes:
+            return closes[-limit:]
+    except Exception:
+        pass
+
+    # fallback: ticker (tylko ostatnia cena)
+    try:
+        t = rget(f"{API_BASE}/rest/trading/ticker/{pair}")
+        # Zonda ticker bywa formatu: {"status":"Ok","ticker":{"rate":"431001.40", ...}}
+        tkr = t.get("ticker") or t
+        last = None
+        for key in ("rate", "last", "c", "close"):
+            v = tkr.get(key) if isinstance(tkr, dict) else None
+            if v is not None:
+                last = float(v)
+                break
+        if last is not None:
+            return [last]  # tylko 1 punkt — analityka ograniczona
+    except Exception:
+        pass
+
+    return []  # nic nie udało się pobrać
+
+def sma(values, n):
+    if len(values) < n: return None
+    return sum(values[-n:]) / n
+
+def rsi(values, period=14):
+    if len(values) <= period: return None
+    gains, losses = 0.0, 0.0
+    # pierwsze średnie
+    for i in range(1, period + 1):
+        diff = values[i] - values[i - 1]
+        gains  += max(diff, 0)
+        losses += max(-diff, 0)
+    if losses == 0: return 100.0
+    avg_gain = gains / period
+    avg_loss = losses / period
+
+    # dalsze wartości (Smoothed RSI)
+    for i in range(period + 1, len(values)):
+        diff = values[i] - values[i - 1]
+        gain  = max(diff, 0)
+        loss  = max(-diff, 0)
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+    if avg_loss == 0: return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+def classify(close, sma12, sma72, rsi14):
+    """
+    Prosta, konserwatywna heurystyka:
+      - BUY (krótko):  close > SMA12 oraz 50 <= RSI14 <= 70
+      - HOLD (długo):  SMA12 > SMA72 oraz close > SMA72
+      - OVERBOUGHT:    RSI14 > 75 (ostrożnie / take profit)
+      - WAIT:          w pozostałych przypadkach
+    """
+    if close is None: return "ERROR"
+    if rsi14 is not None and rsi14 > 75:
+        return "⚠️ OVERBOUGHT"
+    if sma12 is not None and sma72 is not None:
+        if sma12 > sma72 and close > sma72:
+            return "✅ HOLD/AKUMULUJ"
+    if sma12 is not None and rsi14 is not None:
+        if close > sma12 and 50 <= rsi14 <= 70:
+            return "🟢 BUY (krótko)"
+    return "⏸ WAIT"
+
+def send_telegram(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+        r = SESSION.post(url, json=payload, timeout=12)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def format_report(results):
+    ts = datetime.now(timezone.utc).astimezone().strftime("%d.%m.%Y, %H:%M:%S")
+    lines = [f"📊 ALT ANALYZA ({ts})"]
+    for r in results:
+        if r["status"] == "OK":
+            lines.append(
+                f"• {r['pair']}: {r['signal']} "
+                f"(last: {r['last']:.4f}"
+                f"{'' if r['rsi'] is None else f', RSI14: {r['rsi']:.1f}'}"
+                f")"
+            )
+        else:
+            lines.append(f"• {r['pair']}: ❌ BŁĄD — {r.get('error','')[:60]}")
+    lines += [
+        "",
+        "ℹ️ Reguły:",
+        "• BUY: cena > SMA12 oraz RSI 50–70",
+        "• HOLD: SMA12 > SMA72 i cena > SMA72",
+        "• OVERBOUGHT: RSI > 75 (ostrożnie)",
+    ]
+    return "\n".join(lines)
+
+def main():
+    results = []
+    for pair in PAIRS:
+        try:
+            closes = get_candles(pair, interval_sec=3600, limit=120)  # H1, ~5 dni
+            if not closes:
+                results.append({"pair": pair, "status": "ERR", "error": "Brak danych"})
+                continue
+            last  = closes[-1]
+            s12   = sma(closes, 12)
+            s72   = sma(closes, 72)
+            r14   = rsi(closes, 14)
+            sig   = classify(last, s12, s72, r14)
+            results.append({
+                "pair": pair, "status": "OK", "last": last,
+                "sma12": s12, "sma72": s72, "rsi": r14, "signal": sig
+            })
+        except Exception as e:
+            results.append({"pair": pair, "status": "ERR", "error": str(e)})
+
+    report = format_report(results)
+
+    # 1) zawsze drukujemy do logów (przydaje się do historii w Actions)
+    print(report)
+
+    # 2) Telegram gdy dostępny
+    sent = send_telegram(report)
+    print(f"[telegram] sent={sent}")
+
+if __name__ == "__main__":
+    main()
